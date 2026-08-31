@@ -1,0 +1,424 @@
+# Prebuilt binary releases for the komastudios/chawan fork.
+#
+#   prepare ─ build (4 targets) ─ package ─ publish
+#
+# prepare: resolve the version, tag and commit, and decide whether to publish.
+#          Runs before the builds so a bad version costs seconds, not minutes.
+# build:   one tarball per target, smoke tested on the host that built it.
+#          `cha` is not a self-contained binary: it locates its helper programs
+#          at $CHA_BIN_DIR/../libexec/chawan relative to itself, so every asset
+#          is a tarball carrying the whole tree:
+#              chawan/bin/cha            <- the entry point
+#              chawan/bin/mancha
+#              chawan/libexec/chawan/**  <- helpers, resolved relative to cha
+#          Extract anywhere and symlink bin/cha into PATH (cha resolves its own
+#          real path, so symlinks work; a copied binary does not).
+#          The Linux builds are fully static; the macOS builds link the ssl
+#          helper's third-party deps statically and touch only system dylibs.
+# package: collect the tarballs, assert the asset count and write ONE
+#          aggregated SHA256SUMS over all of them. Runs on every trigger, so a
+#          dry run exercises everything except the upload.
+# publish: a single `gh release create`. No checkout, no compiler, no
+#          third-party action — it is the only job holding contents: write.
+#
+# Asset names are chawan-{tag}-{triple}.tar.gz with triples
+#   linux-x86_64 linux-arm64 macos-x86_64 macos-arm64
+# chosen to match the herdr-workspace-plugin pin manifest targets.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, e.g. 0.4.90 (the tag becomes v<version>)
+        type: string
+        required: true
+      ref:
+        description: Commit SHA or branch to build (empty = the ref selected above)
+        type: string
+        default: ''
+      dry_run:
+        description: Build and package the assets but do not publish a release
+        type: boolean
+        default: true
+
+# contents stays read for the whole workflow; only the job that cuts the
+# release gets write, so a compromised build stage cannot push to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+env:
+  NIM_VERSION: '2.2.10'
+
+jobs:
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_exists: ${{ steps.resolve.outputs.tag_exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On a tag push `inputs` is null, so this falls through to github.ref.
+          ref: ${{ inputs.ref || github.ref }}
+          # Needed to resolve an existing tag, and to accept a bare SHA input.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: resolve
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"; VERSION="${TAG#v}"
+          else
+            VERSION="$IN_VERSION"; TAG="v$VERSION"
+          fi
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$VERSION' is not X.Y.Z"; exit 1 ;;
+          esac
+
+          # The fork versions its releases independently of upstream (which is
+          # at v0.5-dev between upstream tags), so there is no version file to
+          # cross-check the tag against; record the upstream base instead.
+          BASE_VERSION="$(cat res/version)"
+
+          # Test the event first: on a tag push IN_DRY_RUN is empty, never 'false'.
+          if   [ "$GITHUB_EVENT_NAME" = "push" ]; then PUBLISH=true
+          elif [ "${IN_DRY_RUN:-}" = "false" ];   then PUBLISH=true
+          else                                         PUBLISH=false
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+
+          # `gh release create --target` is silently ignored when the tag
+          # already exists, so a tag pointing elsewhere would attach these
+          # tarballs to a different commit without any error. Refuse instead.
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            TAG_EXISTS=true
+            TAG_SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::tag $TAG is at $TAG_SHA but this run builds $SHA"
+              exit 1
+            fi
+          else
+            TAG_EXISTS=false
+          fi
+
+          { echo "version=$VERSION"; echo "tag=$TAG"; echo "sha=$SHA"
+            echo "base_version=$BASE_VERSION"
+            echo "publish=$PUBLISH"; echo "tag_exists=$TAG_EXISTS"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Pin gh to this repository so it can never resolve to another one.
+          # Set on every step that shells out to gh.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then EXISTS=true; else EXISTS=false; fi
+          echo "release_exists=$EXISTS" | tee -a "$GITHUB_OUTPUT"
+          if [ "$EXISTS" = "true" ] && [ "$PUBLISH" = "true" ]; then
+            echo "::error::release $TAG already exists; delete it or re-run with dry_run=true"
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          BASE_VERSION: ${{ steps.resolve.outputs.base_version }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+          TAG_EXISTS: ${{ steps.resolve.outputs.tag_exists }}
+        run: |
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| upstream base | \`$BASE_VERSION\` |"
+            echo "| tag | \`$TAG\` (exists: $TAG_EXISTS) |"
+            echo "| commit | \`$SHA\` |"
+            echo "| publish | $PUBLISH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.triple }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: linux-x86_64
+            os: ubuntu-latest
+          - triple: linux-arm64
+            os: ubuntu-24.04-arm
+          - triple: macos-x86_64
+            os: macos-15-intel
+          - triple: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always the resolved commit, never a branch that could move mid-run.
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev libbrotli-dev libssh2-1-dev pkg-config
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install pkgconf openssl@3 brotli libssh2
+
+      # On linux-x86_64 this downloads the official binary tarball; the other
+      # legs bootstrap the compiler from source (a few extra minutes).
+      - uses: jiro4989/setup-nim-action@v2.3.0
+        with:
+          nim-version: ${{ env.NIM_VERSION }}
+          repo-token: ${{ github.token }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          nim -v | head -n1
+          make_args=( TARGET=release "-j$(getconf _NPROCESSORS_ONLN)" )
+          # `pkg-config --static` pulls in Libs.private (-lz and friends),
+          # which the static links below need.
+          make_args+=( "PKG_CONFIG=pkg-config --static" )
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make_args+=( STATIC_LINK=1 )
+          else
+            # macOS cannot link fully statically, but the third-party deps of
+            # the ssl helper must not resolve to Homebrew dylibs, which the
+            # user cannot be assumed to have. Offer the linker a directory
+            # holding only the static archives; ld64 searches -L paths in
+            # order, so these win over the dylibs in the Homebrew lib dirs.
+            libdir="$RUNNER_TEMP/static-libs"; mkdir -p "$libdir"
+            for spec in openssl@3/libssl openssl@3/libcrypto \
+                brotli/libbrotlidec brotli/libbrotlicommon libssh2/libssh2; do
+              a="$(brew --prefix "${spec%/*}")/lib/${spec#*/}.a"
+              [ -f "$a" ] || { echo "::error::missing static library $a"; exit 1; }
+              ln -sf "$a" "$libdir/"
+            done
+            export LDFLAGS="-L$libdir"
+            export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
+          fi
+          make "${make_args[@]}"
+
+      - name: Package
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TRIPLE: ${{ matrix.triple }}
+          # Keep bsdtar from adding AppleDouble (._*) members on macOS.
+          COPYFILE_DISABLE: '1'
+        run: |
+          set -euo pipefail
+          rm -rf pkg dist
+          mkdir -p pkg/chawan dist
+          cp -RP target/release/bin target/release/libexec pkg/chawan/
+          # `make install` also provides btoa; mirror it.
+          ln -sf urlenc pkg/chawan/libexec/chawan/btoa
+          tar -C pkg -czf "dist/chawan-$TAG-$TRIPLE.tar.gz" chawan
+          ls -l dist
+
+      - name: Smoke test
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          tar -xzf "dist/chawan-$TAG-$TRIPLE.tar.gz" -C smoke
+          cha=smoke/chawan/bin/cha
+          "$cha" -v
+          # Exercises the relocated libexec tree (md2html runs as a subprocess).
+          out="$(printf '*hello* **world**\n' | "$cha" -T text/markdown -d)"
+          case "$out" in
+            *"hello world"*) ;;
+            *) echo "::error::markdown dump failed: $out"; exit 1 ;;
+          esac
+          # Exercises the ssl helper: DNS, TLS and certificate verification.
+          "$cha" -d 'https://example.com/' | grep -qi 'Example Domain'
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            for f in "$cha" smoke/chawan/libexec/chawan/cgi-bin/ssl; do
+              if ldd "$f" 2>/dev/null | grep -q '=>'; then
+                echo "::error::$f is not statically linked"; ldd "$f"; exit 1
+              fi
+            done
+          else
+            # No executable may load anything outside the system library dirs.
+            bad=0
+            while IFS= read -r f; do
+              if otool -L "$f" 2>/dev/null | tail -n +2 \
+                  | grep -Eq '/opt/homebrew|/usr/local'; then
+                echo "::error::$f links against Homebrew libraries"
+                otool -L "$f"; bad=1
+              fi
+            done < <(find smoke/chawan -type f -perm -u+x)
+            [ "$bad" -eq 0 ]
+          fi
+          echo "smoke test passed"
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v4
+        with:
+          # Unique per leg: upload-artifact@v4 rejects a repeated name outright.
+          name: chawan-${{ matrix.triple }}
+          path: dist/chawan-*
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package and checksum
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chawan-*
+          # Without this, v4 nests each artifact under dist/<artifact-name>/.
+          merge-multiple: true
+          path: dist
+
+      - name: Check the asset set
+        run: |
+          set -euo pipefail
+          n="$(find dist -maxdepth 1 -type f -name 'chawan-*.tar.gz' | wc -l)"
+          if [ "$n" -ne 4 ]; then
+            echo "::error::expected 4 tarballs, found $n"; ls -l dist; exit 1
+          fi
+          ls -l dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          # Hashed from inside dist so the manifest lists bare filenames, and
+          # written outside it first so it cannot hash itself.
+          ( cd dist && find . -maxdepth 1 -type f -printf '%f\n' \
+              | LC_ALL=C sort | xargs sha256sum ) > SHA256SUMS
+          mv SHA256SUMS dist/
+          ( cd dist && sha256sum -c SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          BASE_VERSION: ${{ needs.prepare.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Prebuilt binaries of the komastudios [Chawan](https://sr.ht/~bptato/chawan/) fork (upstream base: \`$BASE_VERSION\`)."
+            echo
+            echo '## Downloads'
+            echo
+            echo 'Each asset is a tarball, not a bare binary: `cha` locates its helper'
+            echo 'programs at `../libexec/chawan` relative to its own real path, so the'
+            echo '`bin/` and `libexec/` directories must stay together:'
+            echo
+            echo '```'
+            echo 'chawan/bin/cha            <- the entry point'
+            echo 'chawan/bin/mancha'
+            echo 'chawan/libexec/chawan/**  <- helper programs'
+            echo '```'
+            echo
+            echo 'Extract anywhere and symlink `cha` into your PATH (symlink, do not copy'
+            echo '— `cha` resolves symlinks to find its helpers):'
+            echo
+            echo '```sh'
+            echo "tar -xzf chawan-$TAG-linux-x86_64.tar.gz -C ~/.local/opt"
+            echo 'ln -sf ~/.local/opt/chawan/bin/cha ~/.local/bin/cha'
+            echo '```'
+            echo
+            echo 'The Linux builds are fully static and run on any distribution; the'
+            echo 'macOS builds only load system libraries (no Homebrew needed). If TLS'
+            echo 'verification fails on an exotic system, point `SSL_CERT_FILE` or'
+            echo '`SSL_CERT_DIR` at your CA bundle.'
+            echo
+            echo '### SHA256'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "Built from \`$SHA\` by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } > dist/notes.md
+          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [prepare, package]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; not republishing" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          args=( "$TAG" --title "$TAG" --notes-file dist/notes.md )
+          if [ "$TAG_EXISTS" = "true" ]; then
+            # Tag-push path: the tag is already there and --target would be ignored.
+            args+=( --verify-tag )
+          else
+            # Dispatch path: gh creates the tag at exactly the commit we built.
+            args+=( --target "$SHA" )
+          fi
+          # Explicit globs: a bare dist/* would upload notes.md as a sixth asset.
+          gh release create "${args[@]}" dist/chawan-*.tar.gz dist/SHA256SUMS
+          echo "published $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
